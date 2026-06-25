@@ -353,6 +353,46 @@ def _check_nht_valid(r1, nh_addr="fe80:1::2"):
     return "Nexthop {} not found in nexthop cache".format(nh_addr)
 
 
+def _check_explicit_ll_nht_scoped(r1, nh_addr="fe80:1::2", ifname="r1-eth0"):
+    """Check that explicit LL NHT is scoped to the peer interface."""
+    output = r1.vtysh_cmd("show bgp nexthop")
+    entries = []
+    current = None
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("{} ".format(nh_addr)):
+            current = {"header": stripped, "details": []}
+            entries.append(current)
+        elif current and line.startswith("  "):
+            current["details"].append(stripped)
+        elif line.startswith(" "):
+            current = None
+
+    if not entries:
+        return "Nexthop {} not found in nexthop cache:\n{}".format(nh_addr, output)
+
+    if len(entries) != 1:
+        return "Expected one NHT entry for {}, found {}:\n{}".format(
+            nh_addr, len(entries), output
+        )
+
+    entry = entries[0]
+    header = entry["header"]
+    if " invalid" in header:
+        return "Nexthop {} is invalid:\n{}".format(nh_addr, output)
+
+    if "#paths 0" in header:
+        return "Nexthop {} has no paths:\n{}".format(nh_addr, output)
+
+    if not any("if {}".format(ifname) in detail for detail in entry["details"]):
+        return "Nexthop {} is not resolved through {}:\n{}".format(
+            nh_addr, ifname, output
+        )
+
+    return None
+
+
 def test_bgp_explicit_ll_nht_after_clear():
     """
     Verify NHT entry for explicit LL peer stays valid after session clear.
@@ -433,6 +473,14 @@ def test_bgp_explicit_ll_nht_after_clear():
     assert (
         result is None
     ), "NHT entry invalid after session clear (explicit LL NHT bug): {}".format(result)
+
+    step("Verify explicit LL NHT is scoped to r1-eth0 after clear")
+    test_func = functools.partial(_check_explicit_ll_nht_scoped, r1)
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+
+    assert (
+        result is None
+    ), "Explicit LL NHT is not scoped to the peer interface: {}".format(result)
 
 
 def test_bgp_explicit_ll_nht_after_remote_restart():

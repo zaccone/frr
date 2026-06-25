@@ -42,6 +42,26 @@ static bool make_prefix(int afi, struct bgp_path_info *pi, struct prefix *p,
 			struct bgp *bgp_nexthop, struct bgp_path_info *pi_source);
 static void bgp_nht_ifp_initial(struct event *event);
 
+static ifindex_t bgp_peer_ll_ifindex(const struct peer *peer,
+				     const union sockunion *su)
+{
+	if (!peer || !su || su->sa.sa_family != AF_INET6 ||
+	    !IN6_IS_ADDR_LINKLOCAL(&su->sin6.sin6_addr))
+		return 0;
+
+	if (peer->conf_if)
+		return su->sin6.sin6_scope_id;
+
+	if (peer->ifname) {
+		if (su->sin6.sin6_scope_id)
+			return su->sin6.sin6_scope_id;
+
+		return ifname2ifindex(peer->ifname, peer->bgp->vrf_id);
+	}
+
+	return 0;
+}
+
 DEFINE_HOOK(bgp_nht_path_update, (struct bgp *bgp, struct bgp_path_info *pi, bool valid),
 	    (bgp, pi, valid));
 
@@ -198,8 +218,7 @@ void bgp_replace_nexthop_by_peer(struct peer_connection *from, struct peer_conne
 	 * Gather the ifindex for if up/down events to be
 	 * tagged into this fun
 	 */
-	if (from_peer->conf_if && IN6_IS_ADDR_LINKLOCAL(&from->su.sin6.sin6_addr))
-		ifindex = from->su.sin6.sin6_scope_id;
+	ifindex = bgp_peer_ll_ifindex(from_peer, &from->su);
 
 	afi = family2afi(pp.family);
 	bncp = bnc_find(&from_peer->bgp->nexthop_cache_table[afi], &pp, 0, ifindex);
@@ -211,9 +230,7 @@ void bgp_replace_nexthop_by_peer(struct peer_connection *from, struct peer_conne
 	 * Gather the ifindex for if up/down events to be
 	 * tagged into this fun
 	 */
-	ifindex = 0;
-	if (to_peer->conf_if && IN6_IS_ADDR_LINKLOCAL(&to->su.sin6.sin6_addr))
-		ifindex = to->su.sin6.sin6_scope_id;
+	ifindex = bgp_peer_ll_ifindex(to_peer, &to->su);
 	bnct = bnc_find(&to_peer->bgp->nexthop_cache_table[afi], &pt, 0, ifindex);
 
 	if (bnct != bncp)
@@ -278,9 +295,8 @@ void bgp_unlink_nexthop_by_peer(struct peer *peer)
 		 * Gather the ifindex for if up/down events to be
 		 * tagged into this fun
 		 */
-		if (afi == AFI_IP6 && peer->conf_if &&
-		    IN6_IS_ADDR_LINKLOCAL(&peer->connection->su.sin6.sin6_addr))
-			ifindex = peer->connection->su.sin6.sin6_scope_id;
+		if (afi == AFI_IP6)
+			ifindex = bgp_peer_ll_ifindex(peer, &peer->connection->su);
 		bnc = bnc_find(&peer->bgp->nexthop_cache_table[afi], &p, 0,
 			       ifindex);
 	}
@@ -343,20 +359,20 @@ int bgp_find_or_add_nexthop(struct bgp *bgp_route, struct bgp *bgp_nexthop, afi_
 		 * peer's LL) using route-map. In such a scenario, do not set
 		 * the ifindex.
 		 *
-		 * Only do this for dynamic LL peers (conf_if set) where
-		 * scope_id is populated early from ifp->ifindex.  For
-		 * explicit LL peers (conf_if NULL, e.g. "neighbor fe80::X
-		 * interface swpN") the scope_id arrives only after the TCP
-		 * handshake; using it here would create a BNC keyed with the
-		 * real ifindex while peer-tracking already created one with
-		 * ifindex 0, causing a stale NHT entry after session flaps.
+		 * Interface-based LL peers use scoped NHT entries.  For
+		 * unnumbered peers, the scope id is learned into the peer
+		 * sockunion.  For explicit LL peers, e.g. "neighbor fe80::X
+		 * interface swpN", derive the scope from the configured
+		 * interface if the kernel did not provide it yet.
 		 */
-		if (afi == AFI_IP6 && pi->peer->conf_if &&
+		if (afi == AFI_IP6 &&
 		    IN6_IS_ADDR_LINKLOCAL(
 			    &pi->peer->connection->su.sin6.sin6_addr) &&
 		    IPV6_ADDR_SAME(&pi->peer->connection->su.sin6.sin6_addr,
 				   &p.u.prefix6))
-			ifindex = pi->peer->connection->su.sin6.sin6_scope_id;
+			ifindex =
+				bgp_peer_ll_ifindex(pi->peer,
+						    &pi->peer->connection->su);
 
 		/*
 		 * A route may carry a link-local nexthop that differs from
@@ -370,10 +386,8 @@ int bgp_find_or_add_nexthop(struct bgp *bgp_route, struct bgp *bgp_nexthop, afi_
 		 *
 		 * Derive ifindex from the peer's connected interface so
 		 * the BNC is tracked locally via interface events instead.
-		 * Skip when the nexthop equals the peer address to avoid
-		 * conflicting with the peer-tracking BNC (ifindex 0) that
-		 * is created before the TCP handshake for explicit LL
-		 * peers.
+		 * Skip when the nexthop equals the peer address; that is
+		 * handled by the peer-scoped case above.
 		 */
 		if (afi == AFI_IP6 && !ifindex && IN6_IS_ADDR_LINKLOCAL(&p.u.prefix6) &&
 		    pi->peer->connection->su.sa.sa_family == AF_INET6 &&
@@ -397,14 +411,15 @@ int bgp_find_or_add_nexthop(struct bgp *bgp_route, struct bgp *bgp_nexthop, afi_
 		 * Gather the ifindex for if up/down events to be
 		 * tagged into this fun
 		 */
-		if (afi == AFI_IP6 && peer->conf_if &&
+		if (afi == AFI_IP6 &&
 		    IN6_IS_ADDR_LINKLOCAL(&peer->connection->su.sin6.sin6_addr)) {
-			ifindex = peer->connection->su.sin6.sin6_scope_id;
+			ifindex = bgp_peer_ll_ifindex(peer, &peer->connection->su);
 			if (ifindex == 0) {
 				if (BGP_DEBUG(nht, NHT)) {
 					zlog_debug(
 						"%s: Unable to locate ifindex, waiting till we have one",
-						peer->conf_if);
+						peer->conf_if ? peer->conf_if
+							      : peer->ifname);
 				}
 				return 0;
 			}
@@ -576,13 +591,8 @@ void bgp_delete_connected_nexthop(afi_t afi, struct peer *peer)
 		 */
 		bnc = bgp_find_ipv6_nexthop_matching_peer(peer);
 	} else {
-		/*
-		 * Gather the ifindex for if up/down events to be
-		 * tagged into this fun
-		 */
-		if (afi == AFI_IP6 && peer->conf_if &&
-		    IN6_IS_ADDR_LINKLOCAL(&peer->connection->su.sin6.sin6_addr))
-			ifindex = peer->connection->su.sin6.sin6_scope_id;
+		if (afi == AFI_IP6)
+			ifindex = bgp_peer_ll_ifindex(peer, &peer->connection->su);
 		bnc = bnc_find(&peer->bgp->nexthop_cache_table[family2afi(p.family)], &p, 0,
 			       ifindex);
 	}
@@ -959,13 +969,7 @@ void bgp_nht_interface_events(struct peer *peer)
 
 	if (!sockunion2hostprefix(&peer->connection->su, &p))
 		return;
-	/*
-	 * Gather the ifindex for if up/down events to be
-	 * tagged into this fun
-	 */
-	if (peer->conf_if &&
-	    IN6_IS_ADDR_LINKLOCAL(&peer->connection->su.sin6.sin6_addr))
-		ifindex = peer->connection->su.sin6.sin6_scope_id;
+	ifindex = bgp_peer_ll_ifindex(peer, &peer->connection->su);
 
 	table = &bgp->nexthop_cache_table[AFI_IP6];
 	bnc = bnc_find(table, &p, 0, ifindex);
@@ -1294,10 +1298,10 @@ static void register_zebra_rnh(struct bgp_nexthop_cache *bnc)
 	if (bnc->ifindex_ipv6_ll) {
 		SET_FLAG(bnc->flags, BGP_NEXTHOP_REGISTERED);
 		/*
-		 * Explicit LL peers (conf_if set) already get validated
-		 * via bgp_nht_interface_events(), so this is a no-op
-		 * for them.  Global-address peers with LL nexthops do
-		 * not go through that path, so they need this.
+		 * Interface-scoped LL peers already get validated via
+		 * bgp_nht_interface_events(), so this is a no-op for them.
+		 * Global-address peers with LL nexthops do not go through that
+		 * path, so they need this.
 		 */
 		event_add_event(bm->master, bgp_nht_ifp_initial, bnc->bgp, bnc->ifindex_ipv6_ll,
 				NULL);
@@ -1728,13 +1732,7 @@ void bgp_nht_reg_enhe_cap_intfs(struct peer *peer)
 
 	if (p.family != AF_INET6)
 		return;
-	/*
-	 * Gather the ifindex for if up/down events to be
-	 * tagged into this fun
-	 */
-	if (peer->conf_if &&
-	    IN6_IS_ADDR_LINKLOCAL(&peer->connection->su.sin6.sin6_addr))
-		ifindex = peer->connection->su.sin6.sin6_scope_id;
+	ifindex = bgp_peer_ll_ifindex(peer, &peer->connection->su);
 
 	bnc = bnc_find(&bgp->nexthop_cache_table[AFI_IP6], &p, 0, ifindex);
 	if (!bnc)
@@ -1778,13 +1776,7 @@ void bgp_nht_dereg_enhe_cap_intfs(struct peer *peer)
 
 	if (p.family != AF_INET6)
 		return;
-	/*
-	 * Gather the ifindex for if up/down events to be
-	 * tagged into this fun
-	 */
-	if (peer->conf_if &&
-	    IN6_IS_ADDR_LINKLOCAL(&peer->connection->su.sin6.sin6_addr))
-		ifindex = peer->connection->su.sin6.sin6_scope_id;
+	ifindex = bgp_peer_ll_ifindex(peer, &peer->connection->su);
 
 	bnc = bnc_find(&bgp->nexthop_cache_table[AFI_IP6], &p, 0, ifindex);
 	if (!bnc)
